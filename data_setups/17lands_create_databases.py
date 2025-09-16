@@ -1,6 +1,6 @@
 ## ==========================================================
 ## Script: 17lands_create_databases.py
-## Author: (Your Name)
+## Author: Andy Breuhaus
 ##
 ## Description:
 ##   - Parse 17Lands CSVs containing game outcomes
