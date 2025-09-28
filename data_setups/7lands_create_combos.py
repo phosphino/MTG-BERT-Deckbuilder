@@ -43,8 +43,6 @@ query = select(scryfall_table.c.name).where(scryfall_table.c.type_line.ilike('%b
 with engine.connect() as conn:
     land_names = conn.execute(query).fetchall()
 land_names = [x[0] for x in land_names]
-print(land_names)
-
 def table_card_columns(table, land_names):
     # Return all card-related columns for a table, excluding:
     # - any basic lands (provided as land_names)
@@ -128,3 +126,5 @@ data_vals = np.concatenate(data_vals)
 y = np.concatenate(y_parts)
 y = y.astype(int)
 
+M = coo_matrix((data_vals, (rows_idx, cols_idx)),
+               shape=(row_base, ncols), dtype=int).tocsr()
