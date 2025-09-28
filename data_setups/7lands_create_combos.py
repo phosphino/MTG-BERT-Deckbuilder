@@ -43,6 +43,42 @@ query = select(scryfall_table.c.name).where(scryfall_table.c.type_line.ilike('%b
 with engine.connect() as conn:
     land_names = conn.execute(query).fetchall()
 land_names = [x[0] for x in land_names]
+print(land_names)
+
+def save_sparse_combo_graph(MM: coo_matrix,
+                            MW: coo_matrix,
+                            P: coo_matrix,
+                            cardnames: list[str],
+                            path: str):
+    """
+    Save card co-occurrence and win matrices into a single torch file.
+
+    Args:
+        MM (coo_matrix): card-card co-occurrence counts (# games played together)
+        MW (coo_matrix): card-card win counts (# wins together)
+        P  (coo_matrix): card-card win rates (MW / MM)
+        cardnames (list[str]): ordered list of card names, index-aligned
+        path (str): file path to save (.pt)
+    """
+
+    data = {
+        "MM": MM,             # scipy.sparse.coo_matrix
+        "MW": MW,             # scipy.sparse.coo_matrix
+        "P": P,               # scipy.sparse.coo_matrix
+        "cardnames": cardnames,  # list of str
+        "meta": {
+            "MM": "Number of games card i and card j were played together",
+            "MW": "Number of wins where card i and card j were played together",
+            "P":  "Win rate when card i and j are played together (MW / MM)",
+            "cardnames": "Index-aligned list of card names, so cardnames[i] maps to row/col index i",
+            "dtype": "All matrices stored as scipy.sparse.coo_matrix",
+            "note": "Diagonals represent per-card stats; off-diagonals are pairwise combos."
+        }
+    }
+
+    torch.save(data, path)
+    print(f"Saved combo graph to {path}")
+
 def table_card_columns(table, land_names):
     # Return all card-related columns for a table, excluding:
     # - any basic lands (provided as land_names)
@@ -128,3 +164,15 @@ y = y.astype(int)
 
 M = coo_matrix((data_vals, (rows_idx, cols_idx)),
                shape=(row_base, ncols), dtype=int).tocsr()
+
+MM = (M.T@M).tocoo()
+MW = M.T@(M.multiply(y.reshape(-1, 1))).tocoo()
+MM_reciprocal = MM.copy()
+MM_reciprocal.data = np.divide(
+    1, MM_reciprocal.data,
+    out=np.zeros_like(MM_reciprocal.data, dtype=float),
+    where=MM_reciprocal.data != 0
+)
+P = MM_reciprocal.multiply(MW).tocoo()
+
+save_sparse_combo_graph(MM, MW, P, global_all_cards, "combo_matrices.pt")
