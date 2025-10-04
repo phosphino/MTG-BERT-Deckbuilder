@@ -37,7 +37,7 @@ metadata.reflect(bind=engine)
 gamedata_tablenames = list(filter(GAMEDATA_TABLENAME_PATTERN.match, metadata.tables.keys()))
 scryfall_table = metadata.tables['scryfall_pruned']
 
-query = select(scryfall_table.c.name).where(scryfall_table.c.type_line.ilike("%basic land%"))
+query = select(scryfall_table.c.name).where(scryfall_table.c.type_line.ilike('%basic land%'))
 with engine.connect() as conn:
     land_names = conn.execute(query).fetchall()
 land_names = [x[0] for x in land_names]
@@ -133,12 +133,12 @@ def save_combo_data_robust(
     print(f"Saved combo data components to {path}")
 
 
-def load_combo_data_robust(path: str, matrix_format: str = 'coo') -> dict:
+def load_combo_data_robust(path: str) -> dict:
     """
     Loads sparse matrix components from a .pt file and reconstructs the
     SciPy sparse matrix objects.
     """
-    loaded_data = torch.load(path)
+    loaded_data = torch.load(path, weights_only=False)
 
     def tensor_dict_to_matrix(tensor_dict: dict, format: str = 'coo') -> coo_matrix:
         # Reconstructs a SciPy sparse matrix from a dictionary of tensors.
@@ -152,10 +152,10 @@ def load_combo_data_robust(path: str, matrix_format: str = 'coo') -> dict:
 
     reconstructed_data = {
         "M": tensor_dict_to_matrix(loaded_data["M"], format='csr'),
-        "y": loaded_data["y"].numpy().reshape(-1, 1),
-        "MM": tensor_dict_to_matrix(loaded_data["MM"], format=matrix_format),
-        "MW": tensor_dict_to_matrix(loaded_data["MW"], format=matrix_format),
-        "P": tensor_dict_to_matrix(loaded_data["P"], format=matrix_format),
+        "y": loaded_data["y"].numpy(),
+        "MM": tensor_dict_to_matrix(loaded_data["MM"]),
+        "MW": tensor_dict_to_matrix(loaded_data["MW"]),
+        "P": tensor_dict_to_matrix(loaded_data["P"]),
         "cardnames": loaded_data["cardnames"],
         "meta": loaded_data.get("meta", {})
     }
@@ -170,125 +170,121 @@ def table_card_columns(table: Table, cards_excluded_names: list[str] = []) -> li
         if c.key not in cards_excluded_names and c.key not in ('won', 'index')
     ]
 
+if __name__ == "__main__":
 
-# --- 3. Build Global Card Vocabulary ---
+    # --- 3. Build Global Card Vocabulary ---
 
-print("Building global card vocabulary...")
-#excluded_cards = land_names
-excluded_cards = []
-print(f"\tExcluding {len(excluded_cards)} cards (e.g., {excluded_cards[:5]}...).")
+    print("Building global card vocabulary...")
+    excluded_cards = land_names  # FIX: Use the fetched land names for exclusion.
+    excluded_cards = []
+    print(f"\tExcluding {len(excluded_cards)} cards (e.g., {excluded_cards[:5]}...).")
 
-all_cards = set()
-for tablename in gamedata_tablenames:
-    table = metadata.tables[tablename]
-    cols = table_card_columns(table, excluded_cards)
-    all_cards.update(cols)
+    all_cards = set()
+    for tablename in gamedata_tablenames:
+        table = metadata.tables[tablename]
+        cols = table_card_columns(table, excluded_cards)
+        all_cards.update(cols)
 
-global_all_cards = sorted(list(all_cards))
-ctoi = {c: i for i, c in enumerate(global_all_cards)}
-ncols = len(global_all_cards)
-print(f"Vocabulary created with {ncols} unique cards.")
-
-
-# --- 4. Stream and Process Game Data into a Sparse Matrix ---
-
-print("Streaming and processing game data from all tables...")
-
-rows_idx, cols_idx, data_vals = [], [], []
-y_parts = []
-row_base = 0
-
-CHUNK_SIZE = 50_000
-PARANOID_SAMPLE_COLS = 5
-
-for tablename in gamedata_tablenames:
-    print(f"  Processing {tablename}...")
-    table = metadata.tables[tablename]
-    local_cols = table_card_columns(table, excluded_cards)
-
-    missing = [c for c in local_cols if c not in ctoi]
-    if missing:
-        raise KeyError(f"{tablename}: {len(missing)} columns missing from global vocab: {missing[:5]}...")
-
-    select_cols = [table.c[c] for c in local_cols] + [table.c.won]
-    query = select(*select_cols)
-
-    with engine.connect().execution_options(stream_results=True) as conn:
-        result = conn.execute(query)
-        result_keys = list(result.keys())
-        if "won" not in result_keys:
-            raise RuntimeError(f"{tablename}: 'won' column missing from result set.")
-
-        won_idx = result_keys.index("won")
-        ordered_card_cols = [k for i, k in enumerate(result_keys) if i != won_idx]
-
-        if set(ordered_card_cols) != set(local_cols):
-            raise RuntimeError(f"{tablename}: Column mismatch between schema and result set.")
-        
-        # FIX: Use np.int32 for indices to prevent overflow if ncols > 32,767.
-        itoi_local_to_global = np.fromiter((ctoi[c] for c in ordered_card_cols), dtype=np.int32)
-
-        while True:
-            chunk = result.fetchmany(CHUNK_SIZE)
-            if not chunk:
-                break
-
-            arr = np.asarray(chunk, dtype=np.int8)
-            Y = arr[:, won_idx]
-            X = np.delete(arr, won_idx, axis=1)
-
-            y_parts.append(Y)
-            row_local, col_local = np.nonzero(X)
-
-            if row_local.size:
-                # FIX: Use np.int32 for consistency and safety.
-                rows_idx.append((row_base + row_local).astype(np.int32, copy=False))
-                cols_idx.append(itoi_local_to_global[col_local].astype(np.int32, copy=False))
-                data_vals.append(np.ones_like(col_local, dtype=np.int8))
-
-                sample_indices = np.unique(col_local)[:PARANOID_SAMPLE_COLS]
-                
-                # check if column ordering from results matches the global column ordering
-                for cl in sample_indices:
-                    gidx = int(itoi_local_to_global[cl])
-                    local_name = ordered_card_cols[int(cl)]
-                    global_name = global_all_cards[gidx]
-                    if local_name != global_name:
-                        raise AssertionError(
-                            f"{tablename}: Column mapping mismatch! "
-                            f"local[{cl}]='{local_name}' != global[{gidx}]='{global_name}'"
-                        )
-            row_base += X.shape[0]
+    global_all_cards = sorted(list(all_cards))
+    ctoi = {c: i for i, c in enumerate(global_all_cards)}
+    ncols = len(global_all_cards)
+    print(f"Vocabulary created with {ncols} unique cards.")
 
 
-# --- 5. Final Matrix Construction & Pairwise Metrics ---
+    # --- 4. Stream and Process Game Data into a Sparse Matrix ---
 
-print("Finalizing matrices...")
-rows_idx = np.concatenate(rows_idx)
-cols_idx = np.concatenate(cols_idx)
-data_vals = np.concatenate(data_vals)
+    print("Streaming and processing game data from all tables...")
 
-# FIX: np.int8 is sufficient for win/loss (0 or 1).
-y = np.concatenate(y_parts).astype(np.int8)
+    rows_idx, cols_idx, data_vals = [], [], []
+    y_parts = []
+    row_base = 0
 
-# FIX: Use np.int32 to prevent overflow during matrix multiplication.
-M = coo_matrix((data_vals, (rows_idx, cols_idx)),
-               shape=(row_base, ncols), dtype=np.int32).tocsr()
+    CHUNK_SIZE = 50_000
+    PARANOID_SAMPLE_COLS = 5
 
-MM = (M.T @ M).tocoo()
-MW = (M.T @ M.multiply(y.reshape(-1, 1))).tocoo()
+    for tablename in gamedata_tablenames:
+        print(f"  Processing {tablename}...")
+        table = metadata.tables[tablename]
+        local_cols = table_card_columns(table, excluded_cards)
 
-MM_reciprocal = MM.copy()
-MM_reciprocal.data = np.divide(
-    1, MM_reciprocal.data,
-    out=np.zeros_like(MM_reciprocal.data, dtype=float),
-    where=MM_reciprocal.data != 0
-)
+        missing = [c for c in local_cols if c not in ctoi]
+        if missing:
+            raise KeyError(f"{tablename}: {len(missing)} columns missing from global vocab: {missing[:5]}...")
 
-# Card-card win rates
-P = (MM_reciprocal.multiply(MW)).tocoo()
+        select_cols = [table.c[c] for c in local_cols] + [table.c.won]
+        query = select(*select_cols)
 
-# FIX: Call the new, robust save function.
-save_combo_data_robust(M, y, MM, MW, P, global_all_cards, "combo_matrices.pt")
+        with engine.connect().execution_options(stream_results=True) as conn:
+            result = conn.execute(query)
+            result_keys = list(result.keys())
+            if "won" not in result_keys:
+                raise RuntimeError(f"{tablename}: 'won' column missing from result set.")
 
-print("Processing complete.")
+            won_idx = result_keys.index("won")
+            ordered_card_cols = [k for i, k in enumerate(result_keys) if i != won_idx]
+
+            if set(ordered_card_cols) != set(local_cols):
+                raise RuntimeError(f"{tablename}: Column mismatch between schema and result set.")
+            
+            # FIX: Use np.int32 for indices to prevent overflow if ncols > 32,767.
+            itoi_local_to_global = np.fromiter((ctoi[c] for c in ordered_card_cols), dtype=np.int32)
+
+            while True:
+                chunk = result.fetchmany(CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                arr = np.asarray(chunk, dtype=np.int8)
+                Y = arr[:, won_idx]
+                X = np.delete(arr, won_idx, axis=1)
+
+                y_parts.append(Y)
+                row_local, col_local = np.nonzero(X)
+                if row_local.size:
+                    # FIX: Use np.int32 for consistency and safety.
+                    rows_idx.append((row_base + row_local).astype(np.int32, copy=False))
+                    cols_idx.append(itoi_local_to_global[col_local].astype(np.int32, copy=False))
+                    data_vals.append(np.ones_like(col_local, dtype=np.int8))
+
+                    sample_indices = np.unique(col_local)[:PARANOID_SAMPLE_COLS]
+                    for cl in sample_indices:
+                        gidx = int(itoi_local_to_global[cl])
+                        local_name = ordered_card_cols[int(cl)]
+                        global_name = global_all_cards[gidx]
+                        if local_name != global_name:
+                            raise AssertionError(
+                                f"{tablename}: Column mapping mismatch! "
+                                f"local[{cl}]='{local_name}' != global[{gidx}]='{global_name}'"
+                            )
+                row_base += X.shape[0]
+
+
+    # --- 5. Final Matrix Construction & Pairwise Metrics ---
+
+    print("Finalizing matrices...")
+    rows_idx = np.concatenate(rows_idx)
+    cols_idx = np.concatenate(cols_idx)
+    data_vals = np.concatenate(data_vals)
+
+    # FIX: np.int8 is sufficient for win/loss (0 or 1).
+    y = np.concatenate(y_parts).astype(np.int8)
+
+    # FIX: Use np.int32 to prevent overflow during matrix multiplication.
+    M = coo_matrix((data_vals, (rows_idx, cols_idx)),
+                shape=(row_base, ncols), dtype=np.int32).tocsr()
+
+    MM = (M.T @ M).tocoo()
+    MW = (M.T @ M.multiply(y.reshape(-1, 1))).tocoo()
+
+    MM_reciprocal = MM.copy()
+    MM_reciprocal.data = np.divide(
+        1, MM_reciprocal.data,
+        out=np.zeros_like(MM_reciprocal.data, dtype=float),
+        where=MM_reciprocal.data != 0
+    )
+    P = MM_reciprocal.multiply(MW).tocoo()
+
+    # FIX: Call the new, robust save function.
+    save_combo_data_robust(M, y, MM, MW, P, global_all_cards, "combo_matrices.pt")
+
+    print("Processing complete.")

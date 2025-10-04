@@ -72,7 +72,7 @@ oracle_paths = sorted(
     reverse=True
 )
 scryfall_path = oracle_paths[0]  # Latest Oracle file
-
+print("Using Scryfall File:", scryfall_path)
 export_path = os.path.normpath(
     r"C:\Users\breuh\OneDrive\proggy\python\MTG\roberta\data_setups\training_database.db"
 )
@@ -140,7 +140,7 @@ df_for_export = df_utf8.filter(
 )
 after = len(df_for_export)
 print(f"Dropped {before - after} rows due to <UNK> values.")
-
+print(f"{after} rows found")
 
 # ----------------------------------------------------------
 # Export to SQLite
